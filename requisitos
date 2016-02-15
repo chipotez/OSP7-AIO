@@ -1,0 +1,187 @@
+# El objetivo de este documento es tener generar una base de conocimiento -
+# sobre problemas comunes con los que en lo personal me eh encontrado     -
+# durante el proceso de instalación y aunque existe un sin fin de         -
+# documentación pretendo tener en la medida de lo posible un documento en -
+# que se muestren todas las consideraciones necesarias para la correcta   -
+# implementación desde el inicio. 					  -
+#									  -
+# Referencia de Instalación OSP v7 / RHEL 7.2 con Packstack, los pasos se -
+# resumen a continuación.						  -	
+#
+# 1.- Suscribir server a RHN, y actualizar S.O. 
+# 2.- Habilitar repos Necesarios 
+# 3.- Deshabilitar NetworkManager 
+# 4.- Habilitar network.service 
+# 5.- Actualizar sistema 
+# 6.- Instalar openstack-packstack 
+# 7.- Borrar, Redes y Router's 
+# 8.- Cambios en br-ex 
+# 9.- Crear nuevas redes y router
+# 10.-Deploy instancias
+# 
+cat > ./register.sh << EOF
+#/bin/bash
+subscription-manager register --username <usuario> --password <password>
+subscription-manager subscribe --pool=<ID de subscripcion Red Hat>
+subscription-manager repos --disable=*  
+subscription-manager repos --enable=rhel-7-server-rpms 
+subscription-manager repos --enable=rhel-7-server-rh-common-rpms
+subscription-manager repos --enable=rhel-7-server-openstack-7.0-rpms
+yum install yum-utils openstack-packstack -y
+yum update y
+EOF
+
+#subscription-manager list --available
+#subscription-manager list --consumed
+#subscription-manager service-level --list
+#subscription-manager service-level --set=self-support (Para seleccionar el tipo de subscripcion)
+#subscription-manager repos --list
+#yum repolist all
+
+#Deshabilitando NetworkManager
+
+cat > ./network.sh << EOF
+#/bin/bash
+systemctl stop NetworkManager.service
+systemctl disable NetworkManager.service
+systemctl start network.service
+systemctl enable network.service
+EOF
+
+#Generar llaves
+ssh-keygen -t rsa
+
+#Generar Archivo packstack
+packstack --gen-answer-file=/root/$(hostname).txt
+
+#Las líneas de cambio por default del archivo son las siguientes:
+
+CONFIG_DEFAULT_PASSWORD=password_default
+CONFIG_MANILA_INSTALL=y
+CONFIG_CEILOMETER_INSTALL=y
+CONFIG_HEAT_INSTALL=y
+CONFIG_IRONIC_INSTALL=y
+CONFIG_NTP_SERVERS=0.north-america.pool.ntp.org
+CONFIG_RH_USER=<user_rhn_portal>
+CONFIG_RH_PW=<Password_rhn_portal>
+CONFIG_SELFSIGN_CACERT_SUBJECT_CN=$(hostname)
+CONFIG_SELFSIGN_CACERT_SUBJECT_MAIL=admin@$(hostname)
+CONFIG_KEYSTONE_ADMIN_PW=password
+CONFIG_KEYSTONE_SERVICE_NAME=httpd
+CONFIG_NOVA_NETWORK_PUBIF=eno1
+CONFIG_LBAAS_INSTALL=y
+CONFIG_LBAAS_INSTALL=y
+CONFIG_NEUTRON_FWAAS=y
+CONFIG_NEUTRON_ML2_TYPE_DRIVERS=vxlan #(optional,local,flat,vlan,gre)
+CONFIG_HEAT_CLOUDWATCH_INSTALL=y
+CONFIG_HEAT_CFN_INSTALL=y
+
+#Iniciar Packstack
+packstack --answer-file=/root/$(hostname).txt
+reboot
+
+# Realizar los cambios en los archivos de Red, creando brindges:
+
+cat > ./bridge.sh << EOF
+#!/bin/bash
+
+if [ -f /etc/sysconfig/network-scripts/ifcfg-eno1 ]; then 
+  flag1=true; 
+else echo 'File /etc/sysconfig/network-scripts/ifcfg-eno1 does not exist!' 
+fi 
+if [ -f /etc/sysctl.conf ]; then 
+  flag2=true; 
+else echo 'File /etc/sysctl.conf does not exist!' 
+fi 
+if [ -f /etc/sysconfig/iptables ]; then 
+  flag3=true; 
+else echo 'File /etc/sysconfig/iptables does not exist!' 
+fi 
+ethtool eno1 | grep -i 'link detected: yes' > null 
+if [ $? -ne 0 ]; then 
+  echo 'NIC eno1 not found!'; 
+else flag4=true; 
+fi 
+if [ $flag1 ] && [ $flag2 ] && [ $flag3 ] && [ $flag4 ]; then 
+
+  ifdown eno1
+
+  # configure ifcfg-eno1
+  if [ -f /etc/sysconfig/network-scripts/ifcfg-eno1 ]; then 
+    backupTime=`date '+%Y-%m-%d-%H:%M:%S'`
+    echo 'Backup original /etc/sysconfig/network-scripts/ifcfg-eno1 to /etc/sysconfig/network-scripts/bak-ifcfg-eno1-'$backupTime
+    cp /etc/sysconfig/network-scripts/ifcfg-eno1 /etc/sysconfig/network-scripts/bak-ifcfg-eno1-$backupTime
+  fi
+  cat > /etc/sysconfig/network-scripts/ifcfg-eno1 << EOF
+DEVICE=eno1
+TYPE=OVSPort
+DEVICETYPE=ovs
+OVS_BRIDGE=br-ex
+ONBOOT=yes
+EOF
+
+  # configure ifcfg-br-ex
+  if [ -f /etc/sysconfig/network-scripts/ifcfg-br-ex ]; then 
+    backupTime=`date '+%Y-%m-%d-%H:%M:%S'`
+    echo 'Backup original /etc/sysconfig/network-scripts/ifcfg-br-ex to /etc/sysconfig/network-scripts/bak-ifcfg-br-ex-'$backupTime
+    cp /etc/sysconfig/network-scripts/ifcfg-br-ex /etc/sysconfig/network-scripts/bak-ifcfg-br-ex-$backupTime
+  else 
+    touch /etc/sysconfig/network-scripts/ifcfg-br-ex
+  fi
+  cat > /etc/sysconfig/network-scripts/ifcfg-br-ex << EOF
+
+DEVICE=br-ex
+DEVICETYPE=ovs
+TYPE=OVSBridge
+BOOTPROTO=static
+IPADDR=192.168.0.10
+NETMASK=255.255.255.0
+GATEWAY=192.168.0.254
+DNS1=192.168.0.10
+ONBOOT=yes
+NM_CONTROLLED=no
+EOF
+
+  echo 'Start eno1 and br-ex.'
+  ifup eno1
+  ifup br-ex
+
+  # configure sysctl.conf
+  grep -i 'net.ipv4.ip_forward = 1' /etc/sysctl.conf > null
+  if [ $? -ne 0 ]; then
+    backupTime=`date '+%Y-%m-%d-%H:%M:%S'`
+    echo 'Backup original /etc/sysctl.conf to /etc/bak-sysctl.conf-'$backupTime
+    cd /etc/
+    sed -i'bak-*-'$backupTime '$a#Bridged network configuration\nnet.ipv4.ip_forward = 1' sysctl.conf
+  fi
+  grep -i 'net.bridge.bridge-nf-call' /etc/sysctl.conf > null
+  if [ $? -ne 0 ]; then
+    backupTime=`date '+%Y-%m-%d-%H:%M:%S'`
+    echo 'Backup original /etc/sysctl.conf to /etc/bak-sysctl.conf-'$backupTime
+    cd /etc/
+    sed -i'bak-*-'$backupTime '$a#Bridged network configuration\nnet.bridge.bridge-nf-call-ip6tables = 0\nnet.bridge.bridge-nf-call-iptables = 0\nnet.bridge.bridge-nf-call-arptables = 0' sysctl.conf
+  fi
+
+  echo 'Apply the configurations of /etc/sysctl.conf.'
+  sysctl -p /etc/sysctl.conf
+
+  # configure iptables
+  grep -i 'br-ex' /etc/sysconfig/iptables > null
+  if [ $? -ne 0 ]; then
+    backupTime=`date '+%Y-%m-%d-%H:%M:%S'`
+    echo 'Backup original /etc/sysconfig/iptables to /etc/sysconfig/bak-iptables-'$backupTime
+    cd /etc/sysconfig/
+    sed -i'bak-*-'$backupTime '/COMMIT/i -A INPUT -i br-ex -j ACCEPT' iptables
+  fi
+
+  echo 'Restart the firewall.'
+  service iptables restart
+
+  echo 'Reload the libvirt daemon.'
+  service libvirtd reload
+  echo 'Check the bridges.'
+  brctl show
+
+fi 
+
+EOF
